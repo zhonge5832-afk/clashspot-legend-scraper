@@ -1,11 +1,15 @@
 const fs = require('fs');
 const path = require('path');
 const puppeteer = require('puppeteer');
+const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+
+// Apply stealth plugin
+puppeteer.use(StealthPlugin());
 
 const BASE_URL = 'https://clashspot.net/en/rankings/players/legend';
 const START_PAGE = Number(process.env.START_PAGE || 1);
 const MAX_PAGES = Number(process.env.MAX_PAGES || 200);
-const DELAY_MS = Number(process.env.DELAY_MS || 2000); // Increased default to avoid CAPTCHAs
+const DELAY_MS = Number(process.env.DELAY_MS || 3000);
 const OUTPUT_PATH = process.env.OUTPUT_PATH || 'output/clashspot-legend-tags.json';
 const DEBUG_MODE = process.env.DEBUG_MODE === 'true';
 
@@ -15,7 +19,6 @@ function sleep(ms) {
 
 function extractTagsFromHtml(html) {
   const tagSet = new Set();
-  // More flexible regex to handle various URL endings
   const regex = /\/en\/player\/([A-Z0-9]+)(?:\/|["'?#\s])/gi;
   let match;
 
@@ -36,12 +39,12 @@ async function detectCaptcha(page) {
   const captchaIndicators = await page.evaluate(() => {
     const indicators = [];
     
-    // Check for common CAPTCHA/bot-check elements
     if (document.querySelector('[class*="captcha"]')) indicators.push('captcha_class');
     if (document.querySelector('[id*="captcha"]')) indicators.push('captcha_id');
     if (document.body.innerText.includes('Are you a robot')) indicators.push('robot_check_text');
     if (document.body.innerText.includes('hCaptcha')) indicators.push('hcaptcha_text');
     if (document.body.innerText.includes('Cloudflare')) indicators.push('cloudflare_text');
+    if (document.body.innerText.includes('security verification')) indicators.push('cloudflare_verification');
     if (document.querySelector('iframe[src*="captcha"]')) indicators.push('captcha_iframe');
     if (document.querySelector('iframe[src*="challenges"]')) indicators.push('challenge_iframe');
     
@@ -51,11 +54,24 @@ async function detectCaptcha(page) {
   return captchaIndicators;
 }
 
+async function waitForCloudflareChallenge(page) {
+  // Wait for Cloudflare challenge to complete (up to 30 seconds)
+  try {
+    await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {});
+    console.log('  Cloudflare challenge completed.');
+    return true;
+  } catch (err) {
+    console.warn('  Cloudflare challenge did not complete in time.');
+    return false;
+  }
+}
+
 async function fetchPage(browser, pageNum) {
   const page = await browser.newPage();
 
   try {
-    // Set headers to appear as a real browser
+    await page.setViewport({ width: 1920, height: 1080 });
+
     await page.setUserAgent(
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
     );
@@ -67,13 +83,6 @@ async function fetchPage(browser, pageNum) {
       'Referer': 'https://clashspot.net/'
     });
 
-    // Hide webdriver property
-    await page.evaluateOnNewDocument(() => {
-      Object.defineProperty(navigator, 'webdriver', {
-        get: () => false
-      });
-    });
-
     const url = `${BASE_URL}?p=${pageNum}`;
     console.log(`Loading ${url}...`);
 
@@ -82,40 +91,49 @@ async function fetchPage(browser, pageNum) {
       timeout: 60000
     });
 
-    // Wait for player links to appear
-    try {
-      await page.waitForSelector('a[href*="/en/player/"]', { timeout: 10000 });
-    } catch (err) {
-      console.warn('Player links selector not found; continuing with current DOM.');
+    // Check for Cloudflare challenge and wait for it to complete
+    await sleep(2000);
+    let captchaDetected = await detectCaptcha(page);
+    
+    if (captchaDetected.some(ind => ind.includes('cloudflare'))) {
+      console.log('  Cloudflare challenge detected, waiting for completion...');
+      await waitForCloudflareChallenge(page);
+      await sleep(3000);
+      captchaDetected = await detectCaptcha(page);
     }
 
-    // Extra delay to allow dynamic content to fully load
-    await sleep(3000);
+    // Wait for player links
+    try {
+      await page.waitForSelector('a[href*="/en/player/"]', { timeout: 10000 });
+      console.log('  Player links loaded.');
+    } catch (err) {
+      console.warn('  Player links selector not found; continuing with current DOM.');
+    }
 
-    // Check for CAPTCHA indicators
-    const captchaDetected = await detectCaptcha(page);
+    await sleep(2000);
+
+    // Final CAPTCHA check
+    captchaDetected = await detectCaptcha(page);
     if (captchaDetected.length > 0) {
-      console.error(`⚠️  CAPTCHA DETECTED: ${captchaDetected.join(', ')}`);
-      console.error('The site is blocking automated access. You may need to:');
-      console.error('  1. Use a proxy service');
-      console.error('  2. Increase DELAY_MS to slow down requests');
-      console.error('  3. Add manual verification or use a CAPTCHA solving service');
+      console.error(`⚠️  CAPTCHA STILL PRESENT: ${captchaDetected.join(', ')}`);
+      console.error('  The site is still blocking access. Consider:');
+      console.error('    - Increasing DELAY_MS further');
+      console.error('    - Using a proxy service');
+      console.error('    - Manual verification');
     }
 
     const html = await page.content();
 
-    // Log first portion of HTML for debugging
     if (DEBUG_MODE) {
-      const htmlPreview = html.slice(0, 5000);
       const debugFile = `debug-page-${pageNum}.html`;
       fs.writeFileSync(debugFile, html);
-      console.log(`Debug: Full HTML saved to ${debugFile}`);
-      console.log(`Debug: HTML preview (first 5000 chars):\n${htmlPreview}\n`);
+      console.log(`  Debug: HTML saved to ${debugFile}`);
     }
 
-    // Check page content for indicators
-    const pageText = await page.evaluate(() => document.body.innerText.slice(0, 1000));
-    console.log(`Page text preview: ${pageText.substring(0, 200)}...`);
+    const pageText = await page.evaluate(() => document.body.innerText.slice(0, 500));
+    if (DEBUG_MODE) {
+      console.log(`  Page text preview: ${pageText.substring(0, 150)}...`);
+    }
 
     return html;
   } finally {
@@ -136,7 +154,7 @@ async function main() {
   console.log('');
 
   const browser = await puppeteer.launch({
-    headless: true,
+    headless: 'new',
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
@@ -145,7 +163,8 @@ async function main() {
       '--window-size=1920,1080',
       '--disable-gpu',
       '--no-first-run',
-      '--no-default-browser-check'
+      '--no-default-browser-check',
+      '--disable-web-resources'
     ]
   });
 
@@ -166,13 +185,12 @@ async function main() {
           consecutiveEmptyPages++;
           console.log(`No tags found on page ${page}. (consecutive empty pages: ${consecutiveEmptyPages})`);
           
-          // Stop after 3 consecutive empty pages (likely hit CAPTCHA or end of results)
-          if (consecutiveEmptyPages >= 3) {
-            console.log('Stopping: 3 consecutive empty pages detected.');
+          if (consecutiveEmptyPages >= 2) {
+            console.log('Stopping: Multiple empty pages detected (likely CAPTCHA block).');
             break;
           }
         } else {
-          consecutiveEmptyPages = 0; // Reset counter on successful extraction
+          consecutiveEmptyPages = 0;
           tags.forEach(tag => allTags.add(tag));
           console.log(`✓ Found ${tags.length} tags on page ${page}.`);
 
